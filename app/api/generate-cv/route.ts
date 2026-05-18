@@ -1,10 +1,11 @@
-// Force Node.js runtime — needed for child-process spawning by node-latex
+// Force Node.js runtime
 export const runtime = "nodejs";
 
 import { NextResponse } from "next/server";
-// node-latex is listed in serverExternalPackages in next.config.ts so it is
-// resolved via native require (not bundled), which is required for it to work.
-import latex from "node-latex";
+import { exec } from "child_process";
+import fs from "fs/promises";
+import path from "path";
+import os from "os";
 
 // ---------------------------------------------------------------------------
 // Helper: escape special LaTeX characters in arbitrary user input
@@ -20,58 +21,41 @@ function escapeLatex(str: string): string {
 }
 
 // ---------------------------------------------------------------------------
-// Helper: compile a LaTeX string → Buffer via pdflatex
-// ---------------------------------------------------------------------------
-function compileLaTeX(latexSource: string): Promise<Buffer> {
-  return new Promise((resolve, reject) => {
-    const errorLines: string[] = [];
-
-    const pdfStream = latex(latexSource, {
-      cmd: "pdflatex",
-      passes: 1,
-    });
-
-    const chunks: Buffer[] = [];
-
-    pdfStream.on("data", (chunk: Buffer | string) =>
-      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))
-    );
-
-    // node-latex emits 'error' with an Error object when pdflatex fails
-    pdfStream.on("error", (err: Error & { log?: string }) => {
-      // Attach the raw pdflatex log when available
-      const detail = err.log ?? errorLines.join("\n");
-      reject(
-        new Error(`LaTeX compilation failed: ${err.message}\n${detail}`.trim())
-      );
-    });
-
-    // 'end' fires after all data has been flushed (unlike 'finish' which is
-    // write-side only and may fire before readable consumers receive data)
-    pdfStream.on("end", () => resolve(Buffer.concat(chunks)));
-  });
-}
-
-// ---------------------------------------------------------------------------
 // POST /api/generate-cv
-// Expects JSON body: { name, email, phone, education, skills[], experience }
-// Returns: application/pdf
 // ---------------------------------------------------------------------------
 export async function POST(req: Request) {
   try {
     const data = await req.json();
 
-    // Sanitise every field before embedding in LaTeX
-    const name = escapeLatex(data.name || "Unknown");
-    const email = escapeLatex(data.email || "");
-    const phone = escapeLatex(data.phone || "");
-    const education = escapeLatex(data.education || "");
-    const skills = (data.skills as string[] | undefined)
-      ?.map(escapeLatex)
-      .join(", ");
-    const experience = escapeLatex(data.experience || "");
+    let latexSource = "";
+    
+    // Create a temporary directory for pdflatex
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "cvbrew-"));
+    const texFile = path.join(tmpDir, "main.tex");
 
-    const latexSource = `
+    // Check if we are receiving the new 'resources' payload (from moderncv builder)
+    if (data.resources && Array.isArray(data.resources)) {
+      const mainRes = data.resources.find((r: any) => r.main);
+      if (!mainRes) throw new Error("No main resource found in resources array");
+      latexSource = mainRes.content;
+
+      // Write other resources (like photo.jpg)
+      for (const res of data.resources) {
+        if (!res.main && res.path) {
+          const content = res.encoding === "base64" ? Buffer.from(res.content, "base64") : res.content;
+          await fs.writeFile(path.join(tmpDir, res.path), content);
+        }
+      }
+    } else {
+      // Legacy format handling
+      const name = escapeLatex(data.name || "Unknown");
+      const email = escapeLatex(data.email || "");
+      const phone = escapeLatex(data.phone || "");
+      const education = escapeLatex(data.education || "");
+      const skills = (data.skills as string[] | undefined)?.map(escapeLatex).join(", ");
+      const experience = escapeLatex(data.experience || "");
+
+      latexSource = `
 \\documentclass[11pt,a4paper]{article}
 \\usepackage[utf8]{inputenc}
 \\usepackage[T1]{fontenc}
@@ -106,22 +90,33 @@ ${skills || "No skills listed."}
 \\noindent
 ${
   experience
-    ? experience
-        .split("\n")
-        .map((l) => l.trim())
-        .filter(Boolean)
-        .join("\\\\ ")
+    ? experience.split("\\n").map((l) => l.trim()).filter(Boolean).join("\\\\\\\\ ")
     : "No experience listed."
 }
 
 \\end{document}
 `;
+    }
 
-    const pdfBuffer = await compileLaTeX(latexSource);
+    // Write main tex file
+    await fs.writeFile(texFile, latexSource);
 
-    const safeName = (data.name as string | undefined)
-      ?.replace(/\s+/g, "_")
-      .replace(/[^\w-]/g, "") || "CV";
+    // Compile using local pdflatex
+    const pdfBuffer = await new Promise<Buffer>((resolve, reject) => {
+      exec("pdflatex -interaction=nonstopmode main.tex", { cwd: tmpDir }, async (error, stdout, stderr) => {
+        try {
+          const pdfFile = path.join(tmpDir, "main.pdf");
+          const pdfData = await fs.readFile(pdfFile);
+          resolve(pdfData);
+        } catch (err) {
+          reject(new Error(`LaTeX compilation failed:\n${stdout}`));
+        }
+      });
+    });
+
+    // Clean up temporary directory (run asynchronously)
+    fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+    const safeName = (data.name as string | undefined)?.replace(/\s+/g, "_").replace(/[^\w-]/g, "") || "cv";
 
     return new NextResponse(new Uint8Array(pdfBuffer), {
       status: 200,
@@ -130,10 +125,8 @@ ${
         "Content-Disposition": `attachment; filename="${safeName}.pdf"`,
       },
     });
-  } catch (error: unknown) {
-    const message =
-      error instanceof Error ? error.message : "Failed to generate CV";
-    console.error("[generate-cv]", message);
-    return NextResponse.json({ error: message }, { status: 500 });
+  } catch (error: any) {
+    console.error("[generate-cv]", error.message);
+    return NextResponse.json({ error: error.message }, { status: 500 });
   }
 }
