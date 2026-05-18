@@ -269,30 +269,23 @@ export default function CVBuilder() {
         });
       }
 
-      // Step 2: Compile via latex.ytotech.com (free LaTeX API)
-      setStatus("Compiling PDF…");
-      const compileRes = await fetch("https://latex.ytotech.com/builds/sync", {
+      // Step 2: Compile via local API
+      setStatus("Compiling PDF locally…");
+      const compileRes = await fetch("/api/generate-cv", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          compiler: "pdflatex",
           resources: resources,
         }),
       });
 
       if (!compileRes.ok) {
-        // Fallback: compile via latexonline.cc
-        setStatus("Trying alternate compiler…");
-        const encoded = encodeURIComponent(latex);
-        const fallbackUrl = `https://latexonline.cc/compile?text=${encoded}&command=pdflatex`;
-        const fb = await fetch(fallbackUrl);
-        if (!fb.ok) throw new Error("Compilation failed");
-        const blob = await fb.blob();
-        triggerDownload(blob, personal.lname || "cv");
-      } else {
-        const blob = await compileRes.blob();
-        triggerDownload(blob, personal.lname || "cv");
+        const errData = await compileRes.json();
+        throw new Error(errData.error || "Compilation failed");
       }
+
+      const blob = await compileRes.blob();
+      triggerDownload(blob, personal.lname || "cv");
 
       setStatus("Done!");
     } catch (err) {
